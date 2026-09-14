@@ -1,0 +1,19 @@
+[package]
+name = "amm-pool-contract"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = "27.0.3"
+
+[dev-dependencies]
+soroban-sdk = { version = "27.0.3", features = ["testutils"] }
+budget-macros = { path = "../../../crates/macros" }
+
+[features]
+sdk20 = []
+sdk22 = []

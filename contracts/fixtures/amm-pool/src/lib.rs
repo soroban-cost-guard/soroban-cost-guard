@@ -1,0 +1,625 @@
+#![no_std]
+// soroban-sdk 27 deprecates `Events::publish` in favour of the `#[contractevent]`
+// macro. This is a fixture/benchmark contract and the event payloads are not
+// asserted on anywhere; migrating the event model is out of scope for the SDK
+// bump (issue #382). Suppress the deprecation rather than half-migrate it.
+#![allow(deprecated)]
+use soroban_sdk::{
+    contract, contracterror, contractimpl, symbol_short, token, vec, Address, Bytes, BytesN, Env,
+    Symbol, Val, Vec,
+};
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    /// Attempted to initialize an already-initialized pool.
+    AlreadyInitialized = 1,
+    /// Swap or withdraw would result in output below the caller's minimum.
+    SlippageExceeded = 2,
+}
+
+const RESERVE_A: Symbol = symbol_short!("resA");
+const RESERVE_B: Symbol = symbol_short!("resB");
+const TOTAL_SHARES: Symbol = symbol_short!("shares");
+const BAL_A: Symbol = symbol_short!("balA");
+const BAL_B: Symbol = symbol_short!("balB");
+const LP_BAL: Symbol = symbol_short!("lpBl");
+
+/// Upper bound on `n` for the `bytes_*_bench` fixtures below. Backs a
+/// fixed-size stack array so the buffer can be built with a single bulk
+/// `Bytes::from_slice` call in this `#![no_std]` crate (no heap allocator
+/// available for a runtime-sized `Vec<u8>`).
+const BYTES_BENCH_MAX: usize = 65_536;
+
+#[contract]
+pub struct HelperContract;
+
+#[contractimpl]
+impl HelperContract {
+    /// Multiplies two `u32` values using wrapping (modular) arithmetic.
+    ///
+    /// `wrapping_mul` is chosen deliberately for the cross-contract
+    /// benchmark: on overflow it wraps around instead of panicking in
+    /// debug builds, so large inputs won't crash the test and obscure
+    /// the cost measurement.  The result is meaningless for real use —
+    /// this contract exists purely as a cross-contract call target for
+    /// budget measurement.
+    pub fn multiply(_env: Env, a: u32, b: u32) -> u32 {
+        a.wrapping_mul(b)
+    }
+}
+
+#[contract]
+pub struct RelayContract;
+
+/// Cross-contract call-depth fixture (issue #416).
+///
+/// `do_cross_contract_work` above measures the single-hop case. `RelayContract`
+/// measures what happens deeper: register N instances of it, pass instances
+/// 2..=N as `chain` to instance 1, and each `relay` call invokes the next —
+/// so a call to instance 1 reaches call depth N. Each hop carries its own
+/// dispatch and Val-conversion overhead and its own auth context; whether that
+/// accumulates linearly is the finding.
+///
+/// A new fixture contract rather than a change to `cross_contract_test.rs`,
+/// which other work depends on.
+#[contractimpl]
+impl RelayContract {
+    /// Returns `acc` when `chain` is empty; otherwise pops the head, invokes
+    /// `head.relay(tail, acc + 1)`, and returns its result. The returned depth
+    /// equals the number of hops, a deterministic cross-check for the test.
+    pub fn relay(env: Env, chain: Vec<Address>, acc: u32) -> u32 {
+        match chain.first() {
+            None => acc,
+            Some(next) => {
+                let tail = chain.slice(1..chain.len());
+                RelayContractClient::new(&env, &next).relay(&tail, &(acc + 1))
+            }
+        }
+    }
+}
+
+#[contract]
+pub struct ConstantProductPool;
+
+#[contractimpl]
+impl ConstantProductPool {
+    pub fn initialize(env: Env) -> Result<(), Error> {
+        if env.storage().instance().has(&RESERVE_A) {
+            return Err(Error::AlreadyInitialized);
+        }
+        env.storage().instance().set(&RESERVE_A, &0i128);
+        env.storage().instance().set(&RESERVE_B, &0i128);
+        env.storage().instance().set(&TOTAL_SHARES, &0i128);
+        Ok(())
+    }
+
+    pub fn deposit(env: Env, to: Address, amount_a: i128, amount_b: i128) -> i128 {
+        to.require_auth();
+
+        // Invariant: initialize() sets these keys before any deposit/swap/withdraw.
+        let reserve_a: i128 = env.storage().instance().get(&RESERVE_A).unwrap();
+        let reserve_b: i128 = env.storage().instance().get(&RESERVE_B).unwrap();
+        let total_shares: i128 = env.storage().instance().get(&TOTAL_SHARES).unwrap();
+
+        // ── LP share calculation ───────────────────────────────────────
+        //
+        // If this is the first deposit (total_shares == 0), the initial
+        // LP shares are set to the geometric mean of the two token amounts.
+        // `isqrt()` computes the integer (floor) square root — this is the
+        // standard Uniswap v2 / constant-product AMM convention for
+        // initial share minting:  shares = sqrt(amount_a * amount_b).
+        //
+        // For subsequent deposits, shares are minted proportionally — the
+        // depositor receives whichever of the two token ratios yields the
+        // smaller share count (protecting existing LPs from dilution).
+        let shares = if total_shares == 0 {
+            (amount_a * amount_b).isqrt()
+        } else {
+            let from_a = amount_a * total_shares / reserve_a;
+            let from_b = amount_b * total_shares / reserve_b;
+            from_a.min(from_b)
+        };
+
+        let bal_a: i128 = env.storage().instance().get(&BAL_A).unwrap_or(0);
+        let bal_b: i128 = env.storage().instance().get(&BAL_B).unwrap_or(0);
+        let lp_bal: i128 = env.storage().instance().get(&LP_BAL).unwrap_or(0);
+
+        env.storage().instance().set(&BAL_A, &(bal_a + amount_a));
+        env.storage().instance().set(&BAL_B, &(bal_b + amount_b));
+        env.storage()
+            .instance()
+            .set(&RESERVE_A, &(reserve_a + amount_a));
+        env.storage()
+            .instance()
+            .set(&RESERVE_B, &(reserve_b + amount_b));
+        env.storage()
+            .instance()
+            .set(&TOTAL_SHARES, &(total_shares + shares));
+        env.storage().instance().set(&LP_BAL, &(lp_bal + shares));
+
+        env.events()
+            .publish(("deposit",), (to, amount_a, amount_b, shares));
+
+        shares
+    }
+
+    pub fn swap(
+        env: Env,
+        to: Address,
+        is_a_in: bool,
+        amount_in: i128,
+        min_amount_out: i128,
+    ) -> Result<i128, Error> {
+        to.require_auth();
+
+        // Invariant: initialize() sets these keys before any deposit/swap/withdraw.
+        let reserve_a: i128 = env.storage().instance().get(&RESERVE_A).unwrap();
+        let reserve_b: i128 = env.storage().instance().get(&RESERVE_B).unwrap();
+
+        let (in_reserve, out_reserve) = if is_a_in {
+            (reserve_a, reserve_b)
+        } else {
+            (reserve_b, reserve_a)
+        };
+
+        // ── Constant-product swap formula ──────────────────────────────
+        //
+        // Uses the classic constant-product AMM invariant x·y = k
+        // (popularised by Uniswap v2).
+        //
+        //   Before:  in_reserve · out_reserve = k
+        //   After:   (in_reserve + amount_in) · (out_reserve - amount_out) = k
+        //
+        // Solving for `amount_out` (with no swap fee — this is a
+        // benchmarking fixture, not a production pool):
+        //
+        //   amount_out = (out_reserve · amount_in) / (in_reserve + amount_in)
+        //
+        // Soroban uses integer arithmetic (i128); division truncates
+        // toward zero, which slightly favours the pool.
+        let amount_out = out_reserve * amount_in / (in_reserve + amount_in);
+
+        if amount_out < min_amount_out {
+            return Err(Error::SlippageExceeded);
+        }
+
+        let bal_a: i128 = env.storage().instance().get(&BAL_A).unwrap_or(0);
+        let bal_b: i128 = env.storage().instance().get(&BAL_B).unwrap_or(0);
+
+        // ── Update per-user and pool balances after swap ────────────────
+        //
+        // The conditionals below encode which side is the "in" asset (added
+        // to the pool / deducted from the user's tracked balance) vs the
+        // "out" asset (removed from the pool / added to the user's tracked
+        // balance).  When `is_a_in` is true:
+        //   • A flows into the pool   → bal_a decreases, reserve_a increases
+        //   • B flows out of the pool → bal_b increases, reserve_b decreases
+        // The pattern reverses when `is_a_in` is false.
+        //
+        // These tracked balances (`BAL_A`, `BAL_B`) are simulated token
+        // holdings within the contract — they are not on-chain token
+        // transfers.  The reserves drive the pricing formula; the balances
+        // merely track what the user is owed, as an approximate substitute
+        // for real token contracts in this benchmarking fixture.
+        let new_bal_a =
+            bal_a + if is_a_in { amount_in } else { 0 } - if is_a_in { 0 } else { amount_out };
+        let new_bal_b =
+            bal_b + if is_a_in { 0 } else { amount_in } - if is_a_in { amount_out } else { 0 };
+        let new_reserve_a =
+            reserve_a + if is_a_in { amount_in } else { 0 } - if is_a_in { 0 } else { amount_out };
+        let new_reserve_b =
+            reserve_b + if is_a_in { 0 } else { amount_in } - if is_a_in { amount_out } else { 0 };
+
+        env.storage().instance().set(&BAL_A, &new_bal_a);
+        env.storage().instance().set(&BAL_B, &new_bal_b);
+        env.storage().instance().set(&RESERVE_A, &new_reserve_a);
+        env.storage().instance().set(&RESERVE_B, &new_reserve_b);
+
+        env.events()
+            .publish(("swap",), (to, is_a_in, amount_in, amount_out));
+
+        Ok(amount_out)
+    }
+
+    pub fn withdraw(
+        env: Env,
+        to: Address,
+        shares: i128,
+        min_a: i128,
+        min_b: i128,
+    ) -> Result<(i128, i128), Error> {
+        to.require_auth();
+
+        // Invariant: initialize() sets these keys before any deposit/swap/withdraw.
+        let reserve_a: i128 = env.storage().instance().get(&RESERVE_A).unwrap();
+        let reserve_b: i128 = env.storage().instance().get(&RESERVE_B).unwrap();
+        let total_shares: i128 = env.storage().instance().get(&TOTAL_SHARES).unwrap();
+
+        let amount_a = reserve_a * shares / total_shares;
+        let amount_b = reserve_b * shares / total_shares;
+
+        if amount_a < min_a || amount_b < min_b {
+            return Err(Error::SlippageExceeded);
+        }
+
+        let bal_a: i128 = env.storage().instance().get(&BAL_A).unwrap_or(0);
+        let bal_b: i128 = env.storage().instance().get(&BAL_B).unwrap_or(0);
+        let lp_bal: i128 = env.storage().instance().get(&LP_BAL).unwrap_or(0);
+
+        env.storage().instance().set(&BAL_A, &(bal_a - amount_a));
+        env.storage().instance().set(&BAL_B, &(bal_b - amount_b));
+        env.storage()
+            .instance()
+            .set(&RESERVE_A, &(reserve_a - amount_a));
+        env.storage()
+            .instance()
+            .set(&RESERVE_B, &(reserve_b - amount_b));
+        env.storage()
+            .instance()
+            .set(&TOTAL_SHARES, &(total_shares - shares));
+        env.storage().instance().set(&LP_BAL, &(lp_bal - shares));
+
+        env.events()
+            .publish(("withdraw",), (to, shares, amount_a, amount_b));
+
+        Ok((amount_a, amount_b))
+    }
+
+    /// Does nothing, deliberately.
+    ///
+    /// This is the **baseline probe** for marginal-cost assertions. Invoking
+    /// any exported function in the local test VM pays a fixed instantiation
+    /// cost — the host parses and instantiates the whole Wasm module on every
+    /// invocation — before a single byte of contract logic runs. That floor is
+    /// several million CPU instructions and dwarfs the work most of these
+    /// functions actually do, which is why raw local measurements cannot be
+    /// compared against Tier B *network* limits.
+    ///
+    /// Invoking `noop` measures that floor and nothing else. Subtracting it
+    /// from another measurement leaves the *marginal* cost of that call, which
+    /// is the quantity the Tier A limits are expressed in. See the
+    /// `baseline` argument on `budget_cpu_lt` / `budget_mem_lt` /
+    /// `budget_write_bytes_lt` and `cpu_baseline` / `mem_baseline` on
+    /// `budget_lt`.
+    pub fn noop(_env: Env) {}
+
+    pub fn require_auth_only(_env: Env, addr: Address) {
+        addr.require_auth();
+    }
+
+    /// Extends the TTL of this contract's instance storage (and its Wasm
+    /// code) so neither is evicted from the ledger before `extend_to`
+    /// ledgers from now, provided the current TTL is below `threshold`
+    /// ledgers. Touches no pool state; isolated purely so its cost can be
+    /// measured/asserted on its own, the same way `require_auth_only`
+    /// isolates `require_auth`.
+    pub fn extend_instance_ttl(env: Env, threshold: u32, extend_to: u32) {
+        env.storage().instance().extend_ttl(threshold, extend_to);
+    }
+
+    /// Extends the TTL of a single persistent storage entry so it is not
+    /// evicted from the ledger before `extend_to` ledgers from now,
+    /// provided the current TTL is below `threshold` ledgers.
+    ///
+    /// Writes a dummy value on first call so the key exists, then extends.
+    /// Isolated for measurement — same pattern as `extend_instance_ttl`.
+    pub fn extend_persistent_ttl(env: Env, threshold: u32, extend_to: u32) {
+        let key = symbol_short!("pttl");
+        env.storage().persistent().set(&key, &0i128);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, threshold, extend_to);
+    }
+
+    pub fn do_expensive_work(env: Env, n: u32) -> u32 {
+        let mut result: u32 = 0;
+
+        // ── Arithmetic-heavy CPU benchmark loop ────────────────────────
+        // Accumulates the sum of i² for i in 0..n using wrapping
+        // arithmetic.  Both `wrapping_mul` (i·i) and `wrapping_add`
+        // (result + i²) are used so the loop cannot panic on overflow in
+        // debug builds — panicking would terminate the test early and
+        // report a misleadingly low cost estimate.
+        //
+        // The result value is discarded; this loop exists purely to
+        // consume CPU instructions for budget measurement.
+        for i in 0..n {
+            result = result.wrapping_add(i.wrapping_mul(i));
+        }
+
+        let mut vec = Vec::new(&env);
+        for i in 0..(n.min(100)) {
+            vec.push_back(i);
+        }
+        env.storage().instance().set(&symbol_short!("vec"), &vec);
+
+        result
+    }
+
+    pub fn burn_resources(env: Env, n: u32) -> u32 {
+        let mut acc: u32 = 0;
+
+        for i in 0..n {
+            acc = acc.wrapping_add(i.wrapping_mul(i).wrapping_add(1));
+            for j in 0..n.min(100) {
+                acc = acc.wrapping_add(j.wrapping_mul(j));
+            }
+        }
+
+        let mut vec = Vec::new(&env);
+        for i in 0..n.min(200) {
+            vec.push_back(i);
+        }
+        env.storage().instance().set(&symbol_short!("burn"), &vec);
+
+        let mut vec2 = Vec::new(&env);
+        for i in 0..n.min(200) {
+            vec2.push_back(i.wrapping_mul(i));
+        }
+        env.storage().instance().set(&symbol_short!("brn2"), &vec2);
+
+        acc
+    }
+
+    /// Performs only the arithmetic loop used by `do_expensive_work`.
+    ///
+    /// This is the isolated VM-instruction benchmark. It deliberately does
+    /// not access storage, publish events, invoke another contract, or use
+    /// any host function in the hot path. The `Env` argument is retained so
+    /// the function has the same contract-call shape as the other fixtures;
+    /// it is intentionally unused.
+    pub fn do_vm_instruction_work(_env: Env, n: u32) -> u32 {
+        let mut result: u32 = 0;
+        for i in 0..n {
+            result = result.wrapping_add(i.wrapping_mul(i));
+        }
+        result
+    }
+
+    pub fn do_cross_contract_work(env: Env, other: Address, n: u32) -> u32 {
+        let mut result: u32 = 0;
+        for i in 0..n {
+            let product: u32 = env.invoke_contract(
+                &other,
+                &symbol_short!("multiply"),
+                vec![&env, Val::from(i), Val::from(i)],
+            );
+            result = result.wrapping_add(product);
+        }
+        result
+    }
+
+    pub fn do_write_heavy_work(env: Env, n: u32) {
+        for i in 0..n {
+            let mut payload = Bytes::new(&env);
+            for _ in 0..256_u32 {
+                payload.push_back(i as u8);
+            }
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("wh"), i), &payload);
+        }
+    }
+
+    /// Reads `n` keys from instance storage in a loop, exercising the
+    /// ledger read-bytes budget. Writes each key once upfront so the reads
+    /// hit persisted data, then reads them all back to accumulate
+    /// `disk_read_bytes`.
+    ///
+    /// Each key stores a 256-byte `Bytes` value so the read footprint
+    /// grows quickly and is easy to reason about in assertions.
+    /// `n = 100` produces ~25 600 bytes of ledger reads from the read
+    /// phase alone.
+    /// Allocates `n` host-resident `Vec<u32>` elements with no storage or
+    /// authorization side-effects, isolating the memory-bytes cost of a
+    /// pure allocation loop.
+    ///
+    /// Returned as `u32` so the assertion has a deterministic cross-check
+    /// (`v.len()` versus `n`). The fixture exists for the
+    /// `local-vs-network memory-bytes gap` measurement series (issue
+    /// #122); by exercising only `Vec::new(&env).push_back` it minimises
+    /// the write/storage/auth cost surface so the simulation's reported
+    /// `result.cost.memBytes` is dominated by allocation.
+    pub fn allocate_vec(env: Env, n: u32) -> u32 {
+        let mut v: Vec<u32> = Vec::new(&env);
+        for i in 0..n {
+            v.push_back(i);
+        }
+        let len = v.len();
+        // Drop the Vec explicitly so a future change to in-host GC cost
+        // doesn't silently slip into the measurement.
+        drop(v);
+        len
+    }
+
+    pub fn do_read_heavy_work(env: Env, n: u32) -> u32 {
+        // Phase 1: Write n keys to instance storage so they can be read back.
+        for i in 0..n {
+            let mut payload = Bytes::new(&env);
+            for _ in 0..256_u32 {
+                payload.push_back(i as u8);
+            }
+            env.storage()
+                .instance()
+                .set(&(symbol_short!("rh"), i), &payload);
+        }
+
+        // Phase 2: Read all keys back to accumulate disk_read_bytes.
+        // The `sum` return value prevents the compiler from optimizing
+        // away the reads and gives us a simple correctness check.
+        let mut sum: u32 = 0;
+        for i in 0..n {
+            let val: Bytes = env
+                .storage()
+                .instance()
+                .get(&(symbol_short!("rh"), i))
+                .unwrap_or_else(|| Bytes::new(&env));
+            sum = sum.wrapping_add(val.len());
+        }
+        sum
+    }
+    /// Builds an `n`-byte buffer by appending one byte at a time via
+    /// `push_back`, isolating the append-in-a-loop cost pattern the
+    /// memory-category lints warn about as potentially quadratic. No
+    /// storage or authorization side-effects, so the measured cost is
+    /// dominated by the repeated append itself.
+    pub fn bytes_append_bench(env: Env, n: u32) -> u32 {
+        let mut b = Bytes::new(&env);
+        for i in 0..n {
+            b.push_back((i % 256) as u8);
+        }
+        let len = b.len();
+        drop(b);
+        len
+    }
+
+    /// Builds an `n`-byte buffer with a single bulk `Bytes::from_slice`
+    /// call (not a `push_back` loop, so the append-in-a-loop cost above
+    /// doesn't leak into this measurement), then slices out its first
+    /// half with `Bytes::slice`.
+    pub fn bytes_slice_bench(env: Env, n: u32) -> u32 {
+        let data = [0u8; BYTES_BENCH_MAX];
+        let n = n as usize;
+        let b = Bytes::from_slice(&env, &data[..n]);
+        let sliced = b.slice(0..(n / 2) as u32);
+        let len = sliced.len();
+        drop(sliced);
+        drop(b);
+        len
+    }
+
+    /// Builds two `n`-byte buffers with bulk `Bytes::from_slice` calls,
+    /// then joins them with `Bytes::append`, isolating the cost of a
+    /// single bulk concatenation from both the append-loop and slice
+    /// measurements above.
+    pub fn bytes_concat_bench(env: Env, n: u32) -> u32 {
+        let data = [0u8; BYTES_BENCH_MAX];
+        let n = n as usize;
+        let mut a = Bytes::from_slice(&env, &data[..n]);
+        let b = Bytes::from_slice(&env, &data[..n]);
+        a.append(&b);
+        let len = a.len();
+        drop(a);
+        drop(b);
+        len
+    }
+
+    /// Publishes `n` events, exercising the event-emission cost path.
+    /// Each event publishes a two-element topic tuple `("ev",)` and a
+    /// single `u32` value as the body — the smallest plausible event
+    /// payload, so the measured cost is dominated by event-emission
+    /// overhead rather than data serialization.
+    ///
+    /// No storage or compute work is mixed in, keeping the measurement
+    /// isolated to event-emission operations.
+    pub fn do_event_heavy_work(env: Env, n: u32) {
+        for i in 0..n {
+            env.events().publish(("ev",), i);
+        }
+    }
+
+    // ── Cryptographic host functions (issue #414) ──────────────────────────
+    //
+    // The local estimate has particular reason to mislead here: locally these
+    // run as native Rust, on the network they run through the host's metered
+    // implementation. Each function below isolates one crypto host call so the
+    // measured budget is dominated by that call rather than surrounding work.
+    //
+    // `Crypto` (the non-hazmat surface) exposes exactly these:
+    //   • sha256          — measured, `hash_sha256`
+    //   • keccak256       — measured, `hash_keccak256`
+    //   • ed25519_verify  — measured, `verify_ed25519`
+    //   • bls12_381()     — NOT measured: a whole sub-module (G1/G2 add, mul,
+    //     msm, pairing, map-to-curve, hash-to-curve …); its own gap series.
+    // `CryptoHazmat` additionally exposes `secp256k1_recover` and
+    // `secp256r1_verify`, both gated behind the `hazmat` SDK feature and so
+    // unavailable to a plain contract build — also out of scope here.
+    // A new hashing or signature primitive added to `Crypto` is a visible gap:
+    // it will have no fixture and no MEASUREMENTS.md row.
+
+    /// SHA-256 of `data`. Fixture for the cryptographic-operations cost-gap
+    /// series (#414). Call it with three or more input sizes to see whether
+    /// the gap scales with message length.
+    pub fn hash_sha256(env: Env, data: Bytes) -> BytesN<32> {
+        env.crypto().sha256(&data).to_bytes()
+    }
+
+    /// Keccak-256 of `data`. Companion to [`Self::hash_sha256`] (#414).
+    pub fn hash_keccak256(env: Env, data: Bytes) -> BytesN<32> {
+        env.crypto().keccak256(&data).to_bytes()
+    }
+
+    /// One `ed25519_verify` host call over a fixed-size input.
+    ///
+    /// The host performs the full scalar multiplication before it can accept
+    /// or reject, so the metered cost is representative whether or not the
+    /// signature validates — the measurement test invokes this through `try_`
+    /// so an arbitrary 64-byte value does not abort the run. Fixture for #414.
+    pub fn verify_ed25519(env: Env, public_key: BytesN<32>, message: Bytes, signature: BytesN<64>) {
+        env.crypto()
+            .ed25519_verify(&public_key, &message, &signature);
+    }
+
+    // ── Token transfers (issue #415) ──────────────────────────────────────
+
+    /// Transfers `amount` of `token` from this contract to `to`, `count` times
+    /// in a loop.
+    ///
+    /// A transfer is a compound operation — a cross-contract call into the
+    /// token contract plus storage writes on both sides — so its cost cannot
+    /// be inferred by adding up parts and is measured directly. Fixture for
+    /// the token-transfer cost-gap series (#415); the measurement test uses
+    /// the SDK's built-in Stellar Asset Contract as `token` and mints this
+    /// contract a balance first. `count` in {1, N, M} shows whether per-
+    /// transfer cost is constant or varies with batch size.
+    pub fn do_token_transfers(env: Env, token: Address, to: Address, amount: i128, count: u32) {
+        let client = token::Client::new(&env, &token);
+        let from = env.current_contract_address();
+        for _ in 0..count {
+            client.transfer(&from, &to, &amount);
+        }
+    }
+
+    /// Writes `n` entries to persistent storage, isolating the storage-write
+    /// cost for persistent-durability entries. Each key is a unique composite
+    /// `(symbol, u32)` and each value is a small fixed-size `i128`.
+    ///
+    /// No compute, event, or authorization work is mixed in, so the measured
+    /// cost is dominated by the storage write operations.
+    pub fn do_write_persistent(env: Env, n: u32) {
+        for i in 0..n {
+            env.storage()
+                .persistent()
+                .set(&(symbol_short!("wp"), i), &(i as i128));
+        }
+    }
+
+    /// Writes `n` entries to temporary storage, isolating the storage-write
+    /// cost for temporary-durability entries. Each key is a unique composite
+    /// `(symbol, u32)` and each value is a small fixed-size `i128`.
+    ///
+    /// No compute, event, or authorization work is mixed in, so the measured
+    /// cost is dominated by the storage write operations.
+    pub fn do_write_temporary(env: Env, n: u32) {
+        for i in 0..n {
+            env.storage()
+                .temporary()
+                .set(&(symbol_short!("wt"), i), &(i as i128));
+        }
+    }
+
+    /// Writes `n` entries to instance storage, isolating the storage-write
+    /// cost for instance-durability entries. Each key is a unique composite
+    /// `(symbol, u32)` and each value is a small fixed-size `i128`.
+    ///
+    /// No compute, event, or authorization work is mixed in, so the measured
+    /// cost is dominated by the storage write operations.
+    pub fn do_write_instance(env: Env, n: u32) {
+        for i in 0..n {
+            env.storage()
+                .instance()
+                .set(&(symbol_short!("wi"), i), &(i as i128));
+        }
+    }
+}
